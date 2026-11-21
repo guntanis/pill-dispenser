@@ -1,5 +1,6 @@
 #include "WebUI.h"
 #include <WiFi.h>
+#include "Notify.h"
 
 static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -31,7 +32,9 @@ function post(u,b){return j(u,{method:'POST',headers:{'Content-Type':'applicatio
 function status(){j('/api/status').then(function(s){
  var t='Time: '+s.time+'  (NTP '+(s.ntp?'ok':'no')+', RTC '+(s.rtc?'ok':'missing')+')\n';
  t+='WiFi RSSI: '+s.rssi+'  Cup: '+(s.cup?'present':'ABSENT')+'  Busy: '+s.busy+'\n';
- t+='Dose pending: '+(s.pending?'YES':'no')+'\n';
+ t+='Dose pending: '+(s.pending?'YES':'no')+(s.timeValid?'':'  CLOCK INVALID, schedule suspended')+'\n';
+ t+='Dispensed today: ';for(var i=0;i<5;i++)t+=L[i]+':'+s.today[i]+' ';t+=' (cap '+s.capPerDay+'/slot/day, manual lockout '+s.lockoutMin+' min)\n';
+ if(s.note)t+='Note: '+s.note+'\n';
  if(s.last)t+='Last dose: requested '+s.last.requested+', dropped '+s.last.dropped+', jams '+s.last.jams+', doubles '+s.last.doubles+(s.last.refused?' (refused/aborted)':'')+'\n';
  document.getElementById('st').textContent=t;
  if(!built){built=true;build(s)}
@@ -73,7 +76,7 @@ status();setInterval(status,5000);
 
 void WebUI::begin(Schedule* s, State* st, Clock* c, AppStatus* app, WebHooks hooks) {
   sched_ = s; state_ = st; clock_ = c; app_ = app; hooks_ = hooks;
-  server_.on("/", HTTP_GET, [this]() { server_.send_P(200, "text/html", INDEX_HTML); });
+  server_.on("/", HTTP_GET, [this]() { if (auth()) server_.send_P(200, "text/html", INDEX_HTML); });
   server_.on("/api/status", HTTP_GET, [this]() { handleStatus(); });
   server_.on("/api/schedule", HTTP_GET, [this]() { handleGetSchedule(); });
   server_.on("/api/schedule", HTTP_POST, [this]() { handlePostSchedule(); });
@@ -83,6 +86,13 @@ void WebUI::begin(Schedule* s, State* st, Clock* c, AppStatus* app, WebHooks hoo
   server_.onNotFound([this]() { sendError(404, "not found"); });
   server_.begin();
   Serial.println("[web] server started on :80");
+}
+
+// Every route goes through this. Digest auth so the password is not sent in clear on the LAN.
+bool WebUI::auth() {
+  if (server_.authenticate(WEB_USER, WEB_PASS)) return true;
+  server_.requestAuthentication(DIGEST_AUTH, "pill-dispenser");
+  return false;
 }
 
 void WebUI::sendError(int code, const char* msg) {
@@ -99,8 +109,20 @@ bool WebUI::readBody(JsonDocument& doc) {
 }
 
 void WebUI::handleStatus() {
+  if (!auth()) return;
   JsonDocument d;
+  struct tm t;
+  bool timeValid = clock_->now(t);
   d["time"] = clock_->iso();
+  d["timeValid"] = timeValid;
+  d["note"] = app_->lastNote;
+  d["capPerDay"] = MAX_PILLS_PER_SLOT_PER_DAY;
+  d["lockoutMin"] = MANUAL_LOCKOUT_MINUTES;
+  {
+    uint32_t today = timeValid ? Clock::dateKey(t) : 0;
+    JsonArray td = d["today"].to<JsonArray>();
+    for (uint8_t i = 0; i < NUM_SLOTS; i++) td.add(state_->dispensedToday(i, today));
+  }
   d["ntp"] = clock_->ntpSynced();
   d["rtc"] = clock_->rtcPresent();
   d["rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
@@ -125,6 +147,7 @@ void WebUI::handleStatus() {
 }
 
 void WebUI::handleGetSchedule() {
+  if (!auth()) return;
   JsonDocument d;
   sched_->toJson(d);
   String out;
@@ -133,14 +156,18 @@ void WebUI::handleGetSchedule() {
 }
 
 void WebUI::handlePostSchedule() {
+  if (!auth()) return;
   JsonDocument d;
   if (!readBody(d)) { sendError(400, "bad json"); return; }
   if (!sched_->setFromJson(d.as<JsonVariantConst>())) { sendError(400, "invalid schedule (range/duplicate time)"); return; }
   if (!sched_->save()) { sendError(500, "save failed"); return; }
   sendJson(200, "{\"ok\":true}");
+  Notify::send(EVT_CONFIG_CHANGED, String("Schedule changed from ") + server_.client().remoteIP().toString()
+                                   + " (" + sched_->size() + " events)");
 }
 
 void WebUI::handleDispense() {
+  if (!auth()) return;
   JsonDocument d;
   if (!readBody(d)) { sendError(400, "bad json"); return; }
   int slot = d["slot"] | -1;
@@ -152,11 +179,13 @@ void WebUI::handleDispense() {
 }
 
 void WebUI::handleAck() {
+  if (!auth()) return;
   if (hooks_.requestAck) hooks_.requestAck();
   sendJson(200, "{\"ok\":true}");
 }
 
 void WebUI::handleCounts() {
+  if (!auth()) return;
   JsonDocument d;
   if (!readBody(d)) { sendError(400, "bad json"); return; }
   JsonArrayConst c = d["counts"].as<JsonArrayConst>();
@@ -173,4 +202,5 @@ void WebUI::handleCounts() {
     state_->setLowThreshold((uint8_t)constrain(l, 0, 255));
   }
   sendJson(200, "{\"ok\":true}");
+  Notify::send(EVT_CONFIG_CHANGED, String("Pill counts changed from ") + server_.client().remoteIP().toString());
 }

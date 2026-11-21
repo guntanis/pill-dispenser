@@ -31,6 +31,42 @@ void State::consume(uint8_t slot, uint16_t n) {
   setCount(slot, c > n ? c - n : 0);
 }
 
+// Daily counters live under "dd<slot>" with the date they belong to in "ddate".
+// A different date resets all five; dateKey 0 never resets them.
+static void rollDay(Preferences& p, uint32_t dateKey) {
+  if (dateKey == 0) return;
+  if (p.getUInt("ddate", 0) == dateKey) return;
+  for (uint8_t s = 0; s < NUM_SLOTS; s++) {
+    char k[8]; snprintf(k, sizeof(k), "dd%u", s);
+    p.putUShort(k, 0);
+  }
+  p.putUInt("ddate", dateKey);
+}
+
+uint16_t State::dispensedToday(uint8_t slot, uint32_t dateKey) {
+  rollDay(prefs_, dateKey);
+  char k[8]; snprintf(k, sizeof(k), "dd%u", slot);
+  return prefs_.getUShort(k, 0);
+}
+
+void State::addDispensedToday(uint8_t slot, uint16_t n, uint32_t dateKey) {
+  uint16_t c = dispensedToday(slot, dateKey);
+  char k[8]; snprintf(k, sizeof(k), "dd%u", slot);
+  uint32_t v = (uint32_t)c + n;
+  if (v > 65535u) v = 65535u;
+  prefs_.putUShort(k, (uint16_t)v);
+}
+
+uint32_t State::lastDoseAt(uint8_t slot) {
+  char k[8]; snprintf(k, sizeof(k), "la%u", slot);
+  return prefs_.getUInt(k, 0);
+}
+
+void State::setLastDoseAt(uint8_t slot, uint32_t epoch) {
+  char k[8]; snprintf(k, sizeof(k), "la%u", slot);
+  prefs_.putUInt(k, epoch);
+}
+
 uint8_t State::lowThreshold() { return prefs_.getUChar("low", DEFAULT_LOW_THRESHOLD); }
 void State::setLowThreshold(uint8_t t) { prefs_.putUChar("low", t); }
 

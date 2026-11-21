@@ -34,6 +34,7 @@ private:
   AppStatus* app_ = nullptr;
   WebHooks hooks_;
 
+  bool auth();               // false = 401 already sent, handler must return
   void sendJson(int code, const String& body) { server_.send(code, "application/json", body); }
   void sendError(int code, const char* msg);
   bool readBody(JsonDocument& doc);

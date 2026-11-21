@@ -17,6 +17,10 @@ Meta meta(NotifyEvent e) {
     case EVT_DOUBLE:         return {"Double drop", "high", "warning"};
     case EVT_LOW_PILLS:      return {"Low pills", "default", "package"};
     case EVT_OFFLINE_RTC:    return {"Was offline (RTC clock)", "low", "satellite"};
+    case EVT_LIMIT:          return {"Dose limit", "high", "no_entry"};
+    case EVT_SENSOR:         return {"Sensor problem", "high", "warning"};
+    case EVT_CLOCK_INVALID:  return {"Clock invalid", "high", "clock"};
+    case EVT_CONFIG_CHANGED: return {"Settings changed", "low", "gear"};
   }
   return {"Pill dispenser", "default", "pill"};
 }

@@ -7,7 +7,11 @@ enum NotifyEvent {
   EVT_JAM,
   EVT_DOUBLE,
   EVT_LOW_PILLS,
-  EVT_OFFLINE_RTC
+  EVT_OFFLINE_RTC,
+  EVT_LIMIT,            // daily cap or manual lockout refused part of a dose
+  EVT_SENSOR,           // beam blocked before a dose, or still blocked after
+  EVT_CLOCK_INVALID,    // no valid time; scheduled doses suspended
+  EVT_CONFIG_CHANGED    // schedule or counts changed via the web API
 };
 
 namespace Notify {

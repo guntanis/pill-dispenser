@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "MotorBank.h"
 #include "DropSensor.h"
@@ -34,6 +35,11 @@ static uint32_t errorUntil = 0;
 static bool cupLifted = false;
 static uint32_t cupAbsentSince = 0;
 static bool notTakenSent = false;
+static bool clockAlertSent = false;
+static bool timeValid = false;
+
+// RAM copy of the manual lockout, so it also works while the clock is invalid (NVS holds the epoch copy).
+static uint32_t lastDoseMs[NUM_SLOTS] = {0, 0, 0, 0, 0};
 
 // queued web dispense request (handled in loop, never inside the HTTP handler)
 static volatile int8_t reqSlot = -1;
@@ -49,24 +55,32 @@ struct Button {
   bool stable;
   bool lastRaw;
   uint32_t t;
-  explicit Button(uint8_t p) : pin(p), stable(HIGH), lastRaw(HIGH), t(0) {}
+  bool fired;      // hold action already triggered for this press
+  explicit Button(uint8_t p) : pin(p), stable(HIGH), lastRaw(HIGH), t(0), fired(false) {}
 };
 static Button btnA(PIN_BTN_A);
 static Button btnB(PIN_BTN_B);
 
-static bool pressed(Button& b) {   // true once per debounced press
+static bool pressed(Button& b) {   // true once per debounced press; also tracks releases
   bool raw = digitalRead(b.pin);
   uint32_t now = millis();
   if (raw != b.lastRaw) { b.lastRaw = raw; b.t = now; }
   if (now - b.t >= BUTTON_DEBOUNCE_MS && raw != b.stable) {
     b.stable = raw;
+    if (raw == HIGH) b.fired = false;
     return raw == LOW;
   }
   return false;
 }
 
+static bool heldFor(Button& b, uint32_t ms) {   // true once per press, after it has been held ms
+  if (b.stable == LOW && !b.fired && millis() - b.t >= ms) { b.fired = true; return true; }
+  return false;
+}
+
 // ---------------- Dose logic ----------------
 static void raiseError() { errorUntil = millis() + ERROR_DISPLAY_MS; }
+static void note(const char* why) { app.lastNote = why; Serial.printf("[dose] %s\n", why); }
 
 static void acknowledge(const char* why) {
   if (!state.pending()) return;
@@ -77,23 +91,66 @@ static void acknowledge(const char* why) {
 }
 
 // Dispense counts[] one slot at a time. eventMinute < 0 = ad-hoc (no per-event bookkeeping).
-// Returns false if it could not start (no cup / clock invalid for an event).
-static bool startDose(const uint8_t counts[NUM_SLOTS], int eventMinute) {
-  if (!dispenser.cupPresent()) {
-    Serial.println("[dose] cup not present, refusing");
+// manual = web or button, which also enforces the per-slot lockout.
+// counts[] is clamped in place by the daily cap. Returns false if nothing was dispensed.
+static bool startDose(uint8_t counts[NUM_SLOTS], int eventMinute, bool manual) {
+  if (!motorsOk) { note("motor driver not found, refusing"); raiseError(); return false; }
+  if (!dispenser.cupPresent()) { note("cup not present, refusing"); raiseError(); return false; }
+
+  sensor.poll();
+  if (sensor.beamBroken()) {
+    note("beam blocked before dispensing, refusing");
+    Notify::send(EVT_SENSOR, "Beam blocked before dispensing; check the funnel and the sensor");
     raiseError();
     return false;
   }
+
   struct tm t;
   bool timeOk = rtcClock.now(t);
+  uint32_t today = timeOk ? Clock::dateKey(t) : 0;
+  uint32_t nowEpoch = timeOk ? (uint32_t)time(nullptr) : 0;
+
+  // Per-slot daily cap (all paths) and manual lockout (web/button only).
+  bool any = false;
+  for (uint8_t s = 0; s < NUM_SLOTS; s++) {
+    if (!counts[s]) continue;
+    uint16_t done = state.dispensedToday(s, today);
+    if (done + counts[s] > MAX_PILLS_PER_SLOT_PER_DAY) {
+      uint8_t allowed = done >= MAX_PILLS_PER_SLOT_PER_DAY ? 0 : (uint8_t)(MAX_PILLS_PER_SLOT_PER_DAY - done);
+      Notify::send(EVT_LIMIT, String("Slot ") + SLOT_LABELS[s] + ": daily cap of " + MAX_PILLS_PER_SLOT_PER_DAY
+                              + " reached, " + allowed + " of " + counts[s] + " allowed");
+      counts[s] = allowed;
+      raiseError();
+    }
+    if (manual && counts[s]) {
+      bool locked = false;
+      if (lastDoseMs[s] && millis() - lastDoseMs[s] < MANUAL_LOCKOUT_MINUTES * 60000UL) locked = true;
+      uint32_t last = state.lastDoseAt(s);
+      if (nowEpoch && last && nowEpoch >= last && nowEpoch - last < MANUAL_LOCKOUT_MINUTES * 60UL) locked = true;
+      if (locked) {
+        Notify::send(EVT_LIMIT, String("Slot ") + SLOT_LABELS[s] + ": manual dispense refused, last dose less than "
+                                + MANUAL_LOCKOUT_MINUTES + " min ago");
+        counts[s] = 0;
+        raiseError();
+      }
+    }
+    if (counts[s]) any = true;
+  }
+  if (!any) {
+    note("nothing to dispense after limits");
+    // A scheduled event refused by the cap must not retry every minute for the catch-up window.
+    if (eventMinute >= 0 && timeOk) state.setLastDispensed((uint16_t)eventMinute, today);
+    return false;
+  }
+
   if (eventMinute >= 0 && timeOk) {
     // Mark BEFORE moving so a reboot mid-dose can never double-dose.
-    state.setLastDispensed((uint16_t)eventMinute, Clock::dateKey(t));
+    state.setLastDispensed((uint16_t)eventMinute, today);
   }
 
   app.busy = true;
+  app.lastNote = "";
   DispenseResult total;
-  String problems;
   for (uint8_t s = 0; s < NUM_SLOTS; s++) {
     if (!counts[s]) continue;
     DispenseResult r = dispenser.dispense(s, counts[s]);
@@ -102,7 +159,12 @@ static bool startDose(const uint8_t counts[NUM_SLOTS], int eventMinute) {
     total.jams += r.jams;
     total.doubles += r.doubles;
     if (r.refused) total.refused = true;
-    state.consume(s, r.dropped);
+    if (r.dropped) {
+      state.consume(s, r.dropped);
+      state.addDispensedToday(s, r.dropped, today);
+      state.setLastDoseAt(s, nowEpoch);
+      lastDoseMs[s] = millis() ? millis() : 1;
+    }
 
     if (r.dropped < r.requested) {
       String m = String("Slot ") + SLOT_LABELS[s] + ": only " + r.dropped + "/" + r.requested + " dispensed";
@@ -123,16 +185,22 @@ static bool startDose(const uint8_t counts[NUM_SLOTS], int eventMinute) {
   app.hasLast = true;
   app.last = total;
 
+  sensor.poll();
+  if (sensor.beamBroken()) {
+    Notify::send(EVT_SENSOR, "Beam still blocked after dispensing; a pill may be stuck in the funnel");
+    raiseError();
+  }
+
   if (total.dropped > 0) {
-    state.setPending(true, timeOk ? (uint32_t)time(nullptr) : 0);
+    state.setPending(true, nowEpoch);
     notTakenSent = false;
     cupLifted = false;
     Notify::send(EVT_DOSE_READY, String(total.dropped) + " pill(s) in the cup");
   }
-  return true;
+  return total.dropped > 0;
 }
 
-static void sumEventInto(const DoseEvent& e, uint8_t out[NUM_SLOTS]) {
+static void copyCounts(const DoseEvent& e, uint8_t out[NUM_SLOTS]) {
   for (uint8_t i = 0; i < NUM_SLOTS; i++) out[i] = e.counts[i];
 }
 
@@ -147,33 +215,32 @@ static void schedulerTick(const struct tm& t) {
     if (nowMin < mod || nowMin - mod > CATCHUP_MINUTES) continue;
     if (state.lastDispensed(mod) == today) continue;
     uint8_t counts[NUM_SLOTS];
-    sumEventInto(e, counts);
+    copyCounts(e, counts);
     Serial.printf("[sched] event %02u:%02u due\n", e.hour, e.minute);
-    startDose(counts, mod);       // if it fails (no cup) we retry next minute within the catch-up window
+    startDose(counts, mod, false);   // if refused (no cup / sensor) it retries next minute within the catch-up window
     return;
   }
 }
 
-// Button A: dispense the next upcoming enabled event (wraps to tomorrow's first).
-// It is marked done for today so the scheduler will not dose it again.
-static void manualNextEvent() {
-  if (state.pending()) { Serial.println("[btn] dose pending, ignoring"); ind.beep(300); return; }
+// Button A (held): dispense the earliest enabled event that has not been dispensed today,
+// and mark it done so the scheduler will not dose it again. Subject to the manual lockout.
+static void manualDispenseNext() {
+  if (state.pending()) { note("dose pending, button A ignored"); ind.beep(300); return; }
   struct tm t;
-  bool timeOk = rtcClock.now(t);
-  int nowMin = timeOk ? t.tm_hour * 60 + t.tm_min : 0;
-  int best = -1, bestMod = 100000, first = -1, firstMod = 100000;
+  if (!rtcClock.now(t)) { note("clock invalid, button A refused"); ind.beep(300); raiseError(); return; }
+  uint32_t today = Clock::dateKey(t);
+  int best = -1, bestMod = 100000;
   for (size_t i = 0; i < schedule.size(); i++) {
     const DoseEvent& e = schedule.at(i);
     if (!e.enabled || e.totalPills() == 0) continue;
     int mod = e.minuteOfDay();
-    if (mod < firstMod) { firstMod = mod; first = (int)i; }
-    if (mod > nowMin && mod < bestMod) { bestMod = mod; best = (int)i; }
+    if (state.lastDispensed(mod) == today) continue;
+    if (mod < bestMod) { bestMod = mod; best = (int)i; }
   }
-  if (best < 0) best = first;
-  if (best < 0) { ind.beep(300); return; }
+  if (best < 0) { note("all of today's events already dispensed"); ind.beep(300); return; }
   uint8_t counts[NUM_SLOTS];
-  sumEventInto(schedule.at(best), counts);
-  startDose(counts, schedule.at(best).minuteOfDay());
+  copyCounts(schedule.at(best), counts);
+  startDose(counts, bestMod, true);
 }
 
 // ---------------- Web hooks ----------------
@@ -218,7 +285,7 @@ void setup() {
 
   state.begin();
   sensor.begin();
-  motorsOk = motors.begin();
+  motorsOk = motors.begin();         // also drives every coil line low
   dispenser.begin(&motors, &sensor);
   if (!motorsOk) raiseError();
   schedule.begin();
@@ -243,15 +310,24 @@ void setup() {
 #if ENABLE_OLED
   oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
 #endif
+
+  // Watchdog last, after the blocking WiFi wait. Fed in loop() and on every motor half-step.
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
 }
 
 void loop() {
   static int64_t lastMinuteKey = -1;
   static uint32_t lastOled = 0;
 
+  esp_task_wdt_reset();
   web.handle();
   rtcClock.tick();
+  sensor.poll();                     // keeps beamBroken() current between doses
   app.cup = dispenser.cupPresent();
+
+  struct tm t;
+  timeValid = rtcClock.now(t);
 
   // WiFi up/down bookkeeping
   bool up = WiFi.status() == WL_CONNECTED;
@@ -265,8 +341,15 @@ void loop() {
     wifiDownSince = millis();
   }
 
+  // Clock sanity: no valid time means no scheduled doses; say so once.
+  if (!clockAlertSent && !timeValid && millis() >= CLOCK_INVALID_NOTIFY_MS) {
+    clockAlertSent = true;
+    Notify::send(EVT_CLOCK_INVALID, "No valid time (RTC lost power and no NTP); scheduled doses are suspended");
+  }
+
   // Buttons
-  if (pressed(btnA)) { Serial.println("[btn] A"); manualNextEvent(); }
+  pressed(btnA);                     // tracks state; A acts on hold only
+  if (heldFor(btnA, BTN_A_HOLD_MS)) { Serial.println("[btn] A held"); manualDispenseNext(); }
   if (pressed(btnB)) { Serial.println("[btn] B"); acknowledge("button B"); }
 
   // Web-queued dispense
@@ -274,7 +357,7 @@ void loop() {
     uint8_t counts[NUM_SLOTS] = {0, 0, 0, 0, 0};
     counts[reqSlot] = reqCount;
     reqSlot = -1;
-    startDose(counts, -1);
+    startDose(counts, -1, true);
   }
 
   // Cup lifted: present -> absent -> present while a dose is pending = taken
@@ -290,9 +373,8 @@ void loop() {
     cupAbsentSince = 0;
   }
 
-  // Scheduler: once per minute
-  struct tm t;
-  if (rtcClock.now(t)) {
+  // Scheduler: once per minute, only with a valid clock
+  if (timeValid) {
     int64_t key = (int64_t)Clock::dateKey(t) * 1440 + t.tm_hour * 60 + t.tm_min;
     if (key != lastMinuteKey) {
       lastMinuteKey = key;
@@ -301,7 +383,7 @@ void loop() {
   }
 
   // Dose not taken
-  if (state.pending() && !notTakenSent && state.pendingSince() > 0 && rtcClock.now(t)) {
+  if (state.pending() && !notTakenSent && state.pendingSince() > 0 && timeValid) {
     if ((uint32_t)time(nullptr) - state.pendingSince() >= NOT_TAKEN_MINUTES * 60UL) {
       notTakenSent = true;
       Notify::send(EVT_DOSE_NOT_TAKEN, String("Dose not taken after ") + NOT_TAKEN_MINUTES + " min");
@@ -309,7 +391,7 @@ void loop() {
   }
 
   // Indicators
-  if (millis() < errorUntil) ind.setMode(IND_ERROR);
+  if (millis() < errorUntil || !timeValid) ind.setMode(IND_ERROR);
   else if (state.pending()) ind.setMode(IND_DOSE_READY);
   else if (state.anyLow()) ind.setMode(IND_LOW_PILLS);
   else ind.setMode(IND_IDLE);

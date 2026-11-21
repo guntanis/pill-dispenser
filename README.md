@@ -98,7 +98,7 @@ cd firmware
 cp include/secrets.h.example include/secrets.h
 ```
 
-Edit `include/secrets.h` with your WiFi credentials and an unguessable [ntfy.sh](https://ntfy.sh) topic. Set `TZ_STRING` in `src/config.h` to your POSIX timezone. Then:
+Edit `include/secrets.h` with your WiFi credentials, an unguessable [ntfy.sh](https://ntfy.sh) topic, and a username and password for the web UI (the build refuses to run without them). Set `TZ_STRING` in `src/config.h` to your POSIX timezone. Then:
 
 ```sh
 pio run -t upload
@@ -118,13 +118,24 @@ Print four more modules, build the shared funnel and the enclosure, and run the 
 - Per-event "last dispensed" date is written to flash before the motor moves, so a reboot or power blip can never double-dose. A missed event still fires up to an hour late after an outage.
 - Retry with agitation on a missed drop, double-drop detection, cup-present check before every pill.
 - Pill counts per hopper, decremented by pills actually detected, with a low-stock warning.
-- Push notifications via ntfy.sh for dose ready, dose not taken, jam, double drop, low pills.
-- Small web UI and JSON API on the local network. There is no authentication; do not expose it to the internet.
+- Push notifications via ntfy.sh for dose ready, dose not taken, jam, double drop, low pills, sensor problems, invalid clock, and every schedule or count change.
+- Small web UI and JSON API on the local network, behind HTTP digest auth.
+
+### Dose safeguards
+
+The firmware enforces these on every path (schedule, web, button). Details and the tunable constants are in [`firmware/README.md`](firmware/README.md#safeguards).
+
+- Each scheduled event dispenses at most once per day, recorded in flash before the motor moves.
+- A hard cap on pills per hopper per day, counted from pills actually detected.
+- A 30-minute lockout between manual dispenses of the same hopper. Button A must be held for a second.
+- No dispensing without the cup, without the motor drivers, or when the beam sensor already reads blocked.
+- Scheduled doses are suspended while the device has no valid time, and you get told.
+- A hardware watchdog reboots the device if a motor move hangs.
 
 ## Known gaps
 
 - Nothing has been compiled, rendered or run on hardware yet. Expect the first build and the first OpenSCAD render to need small fixes.
-- No web UI authentication. LAN only.
+- Web UI auth is HTTP digest without TLS. Keep the device on your LAN; do not port-forward it.
 - Notifications are dropped when WiFi is down; there is no queue.
 - Dispensing blocks the main loop; the web UI is unresponsive for a few seconds during a dose.
 - No enclosure design yet.

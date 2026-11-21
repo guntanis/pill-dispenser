@@ -11,11 +11,38 @@ pio device monitor         # 115200 baud
 Feature flags (in `src/config.h`, or `build_flags = -DENABLE_OLED=1`): `ENABLE_OLED`, `NOTIFY_BACKEND_NTFY`.
 Set `TZ_STRING` in `config.h` to your POSIX timezone (default `UTC0`).
 
-## WiFi and notifications
-`include/secrets.h` defines `WIFI_SSID`, `WIFI_PASS`, `NTFY_TOPIC`. Install the ntfy app and subscribe to
-the same topic (use an unguessable name; ntfy.sh topics are public). Self-hosted server: define `NTFY_SERVER`.
+## WiFi, web credentials and notifications
+`include/secrets.h` defines `WIFI_SSID`, `WIFI_PASS`, `NTFY_TOPIC`, `WEB_USER` and `WEB_PASS`. The build fails
+if `WEB_USER`/`WEB_PASS` are missing; the web UI never runs without auth.
+Install the ntfy app and subscribe to the same topic (use an unguessable name; ntfy.sh topics are public).
+Self-hosted server: define `NTFY_SERVER`.
 Events: DOSE_READY, DOSE_NOT_TAKEN (after `NOT_TAKEN_MINUTES`), JAM, DOUBLE, LOW_PILLS, OFFLINE_RTC
-(sent when WiFi returns after more than 5 min offline). Web UI: `http://<device-ip>/` (IP printed on Serial).
+(sent when WiFi returns after more than 5 min offline), LIMIT (daily cap or manual lockout refused pills),
+SENSOR (beam blocked before or after a dose), CLOCK_INVALID (no valid time, schedule suspended),
+CONFIG_CHANGED (schedule or counts changed via the web, with the client IP).
+Web UI: `http://<device-ip>/` (IP printed on Serial); the browser asks for `WEB_USER`/`WEB_PASS`.
+
+## Safeguards
+Everything here is enforced in firmware regardless of how a dose was requested (schedule, web, button).
+
+| Safeguard | Setting | What it does |
+|---|---|---|
+| Once per event per day | | An event's "last dispensed" date is written to NVS before the motor moves. A reboot or power blip mid-dose cannot dose it again. |
+| Catch-up window | `CATCHUP_MINUTES` (60) | A missed event fires late after an outage up to this long, then is skipped for the day. |
+| One dose at a time | | No scheduled dose starts while a previous one is pending (not yet acknowledged or cup not lifted). |
+| Per-dose cap | `MAX_PILLS_PER_DOSE` (9) | Clamped when the schedule is saved and on `POST /api/dispense`. |
+| Per-slot daily cap | `MAX_PILLS_PER_SLOT_PER_DAY` (10) | Counts pills actually detected per hopper per calendar day, persisted in NVS. A request over the cap is clamped and a LIMIT notification is sent. While the clock is invalid the counter never resets. |
+| Manual lockout | `MANUAL_LOCKOUT_MINUTES` (30) | Web and button dispenses of the same slot are refused within this window of the last dose from that slot. Kept both in RAM and NVS. Scheduled doses are not subject to it. |
+| Button A hold | `BTN_A_HOLD_MS` (1000) | Button A must be held; a tap does nothing. |
+| Cup present | | Checked before the dose and between pills. Dispense aborts if the cup is removed. |
+| Beam sanity | | Refuses to dispense if the beam already reads "broken" (dead emitter, blocked funnel). Alerts if it is still broken after a dose (pill stuck in the throat). |
+| Motor driver present | | Refuses to dispense if either MCP23017 was not found at boot. Coil lines are driven low at boot and after every move; only one motor is ever energized. |
+| Clock validity | `CLOCK_INVALID_NOTIFY_MS` (5 min) | Scheduled doses only run with a valid time (RTC or NTP, year >= 2024). If no valid time this long after boot, a CLOCK_INVALID notification is sent and the indicator stays red. Button A is refused while the clock is invalid. |
+| Watchdog | `WDT_TIMEOUT_S` (30) | ESP32 task watchdog, fed from the main loop and from every motor half-step. A hang (for example an I2C lock-up mid-move) reboots the device; the once-per-day mark was already written so it does not re-dose. |
+| Web auth | `WEB_USER`, `WEB_PASS` | HTTP digest auth on every route including `/`. |
+| Config audit | | Every schedule or count change via the API sends a CONFIG_CHANGED notification with the client IP. |
+
+These make the firmware harder to misuse. They do not make it a medical device; see the safety section in the root README.
 
 ## Dispense, retry and double-drop logic
 For each pill: arm the beam sensor, turn the disk `STEPS_PER_PILL` half-steps (default one full rev), and
@@ -30,8 +57,8 @@ poll the beam on every half-step so a fast drop mid-rotation is not missed. Afte
 Dose lifecycle: scheduled/manual dose -> pending (persisted in NVS) -> acknowledged by button B, `POST /api/ack`,
 or the cup being lifted and replaced. The event's "last dispensed date" is written before the motor moves, so a
 reboot cannot double-dose. After an outage an event still fires up to `CATCHUP_MINUTES` late. No new scheduled dose
-starts while one is pending. Button A dispenses the next upcoming enabled event (wrapping to the first) and marks
-it done for today.
+starts while one is pending. Button A (held for `BTN_A_HOLD_MS`) dispenses the earliest enabled event not yet
+dispensed today and marks it done, subject to the manual lockout.
 
 ## Pin map
 | Function | Pin / address |
@@ -49,13 +76,14 @@ it done for today.
 | NeoPixel data | GPIO13 (count in `NEOPIXEL_COUNT`) |
 
 ## HTTP API
-`GET /api/status`, `GET|POST /api/schedule` (`{"events":[{hour,minute,counts:[5],enabled}]}`),
+All routes require HTTP digest auth with `WEB_USER`/`WEB_PASS`.
+`GET /api/status` (includes `timeValid`, `today[5]` pills dispensed per slot, `capPerDay`, `lockoutMin`, `note`),
+`GET|POST /api/schedule` (`{"events":[{hour,minute,counts:[5],enabled}]}`),
 `POST /api/dispense` (`{slot:0-4,count}`), `POST /api/ack`, `POST /api/counts` (`{counts:[5],low:n}`).
-No authentication (LAN only).
 
 ## TODO / stubbed
 - Not compiled or tested on hardware yet (PlatformIO was not available when this was written).
-- No web UI/API authentication; do not expose to the internet.
+- Web auth is digest over plain HTTP (no TLS). Keep the device on your LAN; do not port-forward it.
 - ntfy TLS uses `setInsecure()` (no certificate pinning).
 - Notifications are dropped when offline (no queue/retry).
 - Disk geometry: `STEPS_PER_PILL` assumes one pill per full revolution; tune `STEP_DELAY_MS`, debounce and settle times on real hardware.

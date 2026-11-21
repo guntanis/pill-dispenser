@@ -1,7 +1,13 @@
 #include "Dispenser.h"
+#include <esp_task_wdt.h>
 
 static DropSensor* g_sensor = nullptr;
-static void sensorTick() { if (g_sensor) g_sensor->poll(); }
+// Runs after every half-step: poll the beam and feed the watchdog, so a long dose
+// does not trip it but a hung I2C write (no more ticks) does.
+static void sensorTick() {
+  if (g_sensor) g_sensor->poll();
+  esp_task_wdt_reset();
+}
 
 void Dispenser::begin(MotorBank* motors, DropSensor* sensor) {
   motors_ = motors;

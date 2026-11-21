@@ -56,6 +56,20 @@
 #define ERROR_DISPLAY_MS     10000
 #define OFFLINE_NOTIFY_MS    (5UL * 60UL * 1000UL)
 
+// ---------------- Safeguards ----------------
+#define MAX_PILLS_PER_SLOT_PER_DAY 10   // hard cap per hopper per calendar day, every path (schedule, web, button)
+#define MANUAL_LOCKOUT_MINUTES     30   // minimum gap between manual (web/button) dispenses of the same slot
+#define BTN_A_HOLD_MS              1000 // button A must be held this long; a tap does nothing
+#define WDT_TIMEOUT_S              30   // task watchdog: reboot if the main loop or a motor move hangs
+#define CLOCK_INVALID_NOTIFY_MS    (5UL * 60UL * 1000UL)   // alert if no valid time this long after boot
+
+#ifndef WEB_USER
+#error "Define WEB_USER and WEB_PASS in include/secrets.h (see secrets.h.example); the web UI must not run without auth"
+#endif
+#ifndef WEB_PASS
+#error "Define WEB_PASS in include/secrets.h"
+#endif
+
 // ---------------- Time ----------------
 #define TZ_STRING   "UTC0"            // POSIX TZ, e.g. "EST5EDT,M3.2.0,M11.1.0"
 #define NTP_SERVER1 "pool.ntp.org"
